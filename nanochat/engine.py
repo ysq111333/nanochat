@@ -18,7 +18,6 @@ import warnings
 from contextlib import contextmanager
 from collections import deque
 from nanochat.common import compute_init, autodetect_device_type
-from nanochat.checkpoint_manager import load_model
 from contextlib import nullcontext 
 
 # -----------------------------------------------------------------------------
@@ -91,7 +90,8 @@ class KVCache:
         self.kv_shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
         self.kv_cache = None
         self.pos = 0 # current position in time in the cache
-        self.mla_cache = {} 
+        self.mla_cache = {}
+        self.padding_mask = None  # (B, T) bool tensor for padding positions 
     def update_mla(self, layer_idx, kv_latent, k_rope):
         """
         Update MLA cache
@@ -112,9 +112,21 @@ class KVCache:
             return kv_latent_full, k_rope_full
     def reset(self):
         self.pos = 0
+        self.padding_mask = None
 
     def get_pos(self):
         return self.pos
+    
+    def update_padding_mask(self, mask):
+        """
+        Update the padding mask for the cache
+        Args:
+            mask: (B, T_new) bool tensor, True for valid positions
+        """
+        if self.padding_mask is None:
+            self.padding_mask = mask
+        else:
+            self.padding_mask = torch.cat([self.padding_mask, mask], dim=1)
 
     def prefill(self, other):
         """
@@ -453,7 +465,12 @@ class Engine:
         
         # Batch prefill (one forward pass processes all prompts)
         batch_ids = torch.tensor(padded_prompts, dtype=torch.long, device=device)  # (B, max_prompt_len)
-        logits = self.model.forward(batch_ids, kv_cache=kv_cache)  # (B, T, vocab_size)
+        
+        # Update KV cache with padding mask
+        kv_cache.update_padding_mask(attention_mask)
+        
+        # Forward pass with padding mask
+        logits = self.model.forward(batch_ids, kv_cache=kv_cache, padding_mask=attention_mask)  # (B, T, vocab_size)
         logits_last = logits[:, -1, :]  # (B, vocab_size)
         
         # Sample first token (each sequence samples independently)
@@ -495,8 +512,14 @@ class Engine:
             if all(completed):
                 break
             
+            # Create mask for current tokens (all valid since we're in decode phase)
+            current_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=device)
+            
+            kv_cache.update_padding_mask(current_mask)
             # Batch forward pass (true batch processing: one forward processes all sequences)
-            logits = self.model.forward(next_ids, kv_cache=kv_cache)  # (B, 1, vocab_size)
+            # Pass the mask for the current token (all valid)
+            logits = self.model.forward(next_ids, kv_cache=kv_cache, padding_mask=current_mask)  # (B, 1, vocab_size)
+            
             logits = logits[:, -1, :]  # (B, vocab_size)
             
             # Sample next token
@@ -757,6 +780,7 @@ if __name__ == "__main__":
     is equivalent to the faster Engine.generate function here.
     """
     import time
+    from nanochat.checkpoint_manager import load_model
     # init compute
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
     device_type = autodetect_device_type()

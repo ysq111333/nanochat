@@ -43,14 +43,14 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
+def apply_rotary_emb(x, cos, sin):# cos and sin are [1, T, 1, D/2] ,which is already computed for the current sequence length
+    assert x.ndim == 4  # multihead attention[B, T, H, D]
+    d = x.shape[3] // 2 # D/2
+    x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves [B, T, H, D/2]
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
-    y2 = x1 * (-sin) + x2 * cos
-    out = torch.cat([y1, y2], 3) # re-assemble
-    out = out.to(x.dtype) # ensure input/output dtypes match
+    y2 = x1 * (-sin) + x2 * cos # rotate pairs of dims
+    out = torch.cat([y1, y2], 3) # re-assemble [B, T, H, D]
+    out = out.to(x.dtype) # ensure input/output dtypes match [B, T, H, D]
     return out
 
 class CausalSelfAttention(nn.Module):
@@ -68,7 +68,14 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x, cos_sin, kv_cache, padding_mask=None):
+        """
+        Args:
+            x: (B, T, C) input tensor
+            cos_sin: rotary embeddings
+            kv_cache: KV cache for inference
+            padding_mask: (B, T) bool tensor, True for valid positions, False for padding
+        """
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -93,11 +100,34 @@ class CausalSelfAttention(nn.Module):
         if kv_cache is None or Tq == Tk:
             # During training (no KV cache), attend as usual with causal attention
             # And even if there is KV cache, we can still use this simple version when Tq == Tk
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+            if padding_mask is not None:
+                # Need to combine padding mask with causal mask
+                # padding_mask: (B, T), True for valid, False for padding
+                # Create causal mask: (T, T)
+                causal_mask = torch.tril(torch.ones((Tq, Tk), dtype=torch.bool, device=q.device))
+                # Expand padding_mask: (B, T) -> (B, 1, 1, T) for key positions
+                # This masks out padding positions in keys
+                key_padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+                # Combine: causal_mask (1, 1, T, T) & key_padding_mask (B, 1, 1, T)
+                attn_mask = causal_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask  # (B, 1, Tq, Tk)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
         elif Tq == 1:
             # During inference but with a single query in this forward pass:
             # The query has to attend to all the keys/values in the cache
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+            if padding_mask is not None and kv_cache is not None:
+                # padding_mask is for the current input (B, 1)
+                # But we need mask for all cached keys (B, Tk)
+                # Get the full mask from cache if available
+                if hasattr(kv_cache, 'padding_mask') and kv_cache.padding_mask is not None:
+                    full_padding_mask = kv_cache.padding_mask  # (B, Tk)
+                    attn_mask = full_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Tk)
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+                else:
+                    y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
         else:
             # During inference AND we have a chunk of queries in this forward pass:
             # First, each query attends to all the cached keys/values (i.e. full prefix)
@@ -107,6 +137,17 @@ class CausalSelfAttention(nn.Module):
                 attn_mask[:, :prefix_len] = True
             # Then, causal attention within this chunk
             attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
+            
+            # Apply padding mask if provided
+            if padding_mask is not None:
+                if kv_cache is not None and hasattr(kv_cache, 'padding_mask') and kv_cache.padding_mask is not None:
+                    full_padding_mask = kv_cache.padding_mask  # (B, Tk)
+                    key_padding_mask = full_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Tk)
+                    attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask  # (B, 1, Tq, Tk)
+                else:
+                    key_padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+                    attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask  # (B, 1, Tq, Tk)
+            
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
 
         # Re-assemble the heads side by side and project back to residual stream
@@ -152,7 +193,14 @@ class MultiheadLatentAttention(nn.Module):
               f"rope_dim={self.rope_dim}, nope_dim={self.nope_dim}, "
               f"compression_ratio={self.n_embd/self.d_latent:.2f}x")
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x, cos_sin, kv_cache, padding_mask=None):
+        """
+        Args:
+            x: (B, T, C) input tensor
+            cos_sin: rotary embeddings
+            kv_cache: KV cache for inference
+            padding_mask: (B, T) bool tensor, True for valid positions, False for padding
+        """
         B, T, C = x.size()
         
         # --- 1. Generate Query ---
@@ -205,10 +253,25 @@ class MultiheadLatentAttention(nn.Module):
         
         if kv_cache is None or Tq == Tk:
             # Training or first inference
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            if padding_mask is not None:
+                # Combine padding mask with causal mask
+                causal_mask = torch.tril(torch.ones((Tq, Tk), dtype=torch.bool, device=q.device))
+                key_padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+                attn_mask = causal_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask  # (B, 1, Tq, Tk)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         elif Tq == 1:
             # Single token inference
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            if padding_mask is not None and kv_cache is not None:
+                if hasattr(kv_cache, 'padding_mask') and kv_cache.padding_mask is not None:
+                    full_padding_mask = kv_cache.padding_mask  # (B, Tk)
+                    attn_mask = full_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Tk)
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+                else:
+                    y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
         else:
             # Multi-token inference (chunk inference)
             attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device)
@@ -218,6 +281,17 @@ class MultiheadLatentAttention(nn.Module):
             attn_mask[:, prefix_len:] = torch.tril(
                 torch.ones((Tq, Tq), dtype=torch.bool, device=q.device)
             )
+            
+            # Apply padding mask if provided
+            if padding_mask is not None:
+                if kv_cache is not None and hasattr(kv_cache, 'padding_mask') and kv_cache.padding_mask is not None:
+                    full_padding_mask = kv_cache.padding_mask  # (B, Tk)
+                    key_padding_mask = full_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Tk)
+                    attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask  # (B, 1, Tq, Tk)
+                else:
+                    key_padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+                    attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask  # (B, 1, Tq, Tk)
+            
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         
         # --- 9. Reassemble and output projection ---
@@ -246,8 +320,8 @@ class Block(nn.Module):
             self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos_sin, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, kv_cache)
+    def forward(self, x, cos_sin, kv_cache, padding_mask=None):
+        x = x + self.attn(norm(x), cos_sin, kv_cache, padding_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -361,7 +435,15 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', padding_mask=None):
+        """
+        Args:
+            idx: (B, T) input token ids
+            targets: (B, T) target token ids for training
+            kv_cache: KVCache object for inference
+            loss_reduction: 'mean' or 'none' for loss computation
+            padding_mask: (B, T) bool tensor, True for valid positions, False for padding
+        """
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -378,11 +460,11 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if self.gradient_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(
-                    block, x, cos_sin, kv_cache,
+                    block, x, cos_sin, kv_cache, padding_mask,
                     use_reentrant=False
                 )
             else:
-                x = block(x, cos_sin, kv_cache)
+                x = block(x, cos_sin, kv_cache, padding_mask)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
