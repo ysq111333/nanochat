@@ -30,6 +30,7 @@
 
 
 
+
 # 评估任务扩展
 
 
@@ -155,6 +156,16 @@ MLA 的核心原理基于对注意力机制中 Key-Value 矩阵具有低秩（Lo
 - GPTConfig 添加 MLA参数
 - 实现 MultiheadLatentAttention 类，实现投影压缩，rope解耦等。
 - Block 类通过添加if判断语句支持 MLA
+- KVCache 类中添加updat_mla
+### 具体细节
+MLA 的核心在于将 "内容 (Content)" 与 "位置 (RoPE)" 解耦，并对内容部分进行向量压缩：
+
+- 1.维度解耦: head_dim 被拆成nope_dim和rope_dim。
+- 2.KV 低秩压缩: x先通过 c_kv_compress 投影到一个低维的潜在向量 c_KV (维度为 d_latent)，然后在计算注意力时，通过 c_k_expand 和 c_v_expand 将潜在向量实时恢复为 k_nope 和 v，同时为了保留高精度的位置信息，k_rope 不参与压缩，而是通过独立的 c_k_rope 路径直接生成并携带位置编码。
+- 3.高效推理缓存，MLA Cache 仅需存储kv_latent和k_rope，这个存储通过KVCache中添加到updat_mla实现。
+
+值得注意的是，我没有选择对q进行压缩，算是实现的不太一样的地方，和论文原图结构不太一样，我选择直接投影到q_nope和q_rope，用于后续注意力分数计算。
+
 
 ### loss图
 
@@ -178,16 +189,20 @@ dev/run_attention_comparison.sh跑通，但对比不太明显，推断为数据�
 
 ### 关键设计： 
 - 左侧padding与mask矩阵：找到最长序列，左侧 padding（保持生成位置对齐）。选取左侧padding的原因为Causal LLM 生成时，最后一个 token 的位置最重要，左侧 padding 确保所有序列的最后一个有效 token 都在同一位置。
-- Tokenizer 扩展（tokenizer.py）:为两个 tokenizer 类都添加了 get_pad_token_id() 方法,目的是使用 BOS token 作为 PAD token，并保持添加BOS token后与现有 token 体系的兼容性
-
-
+- Tokenizer 扩展（tokenizer.py）：为两个 tokenizer 类都添加了 get_pad_token_id() 方法,目的是使用 BOS token 作为 PAD token，并保持添加BOS token后与现有 token 体系的兼容性
+- 模型推理扩展：nanochat.py中相关部分实现padding_mask相关改动，使模型推理适配padding_mask，主要修改于注意力机制计算以及forward函数部分。
+- KVCache扩展：添加update_padding_mask方法。
+### 具体流程： 
+- 1.左侧padding并创建mask矩阵：得到padded_prompts以及padding_mask，同时在nanochat.py中相关部分实现padding_mask相关改动，使模型推理适配padding_mask。
+- 2.预填充：创建KVcache，调用kv_cache.update_padding_mask方法更新KVcache，调用model.forward方法得到logits并获取logits[:, -1, :]即预测的logits，然后根据温度情况采样下一个token。
+- 3.批次解码：首先通过维护completed列表，追踪batch中每个Sequence 的状态，然后针对提前结束的序列采用 Padding Token仅用于维持矩阵形状对齐配合 active_mask 确保无效数据不会污染最终输出和KV Cache ，最后实现在同一 Batch内不同的采样策略，能够同时处理温度等于0和大于0的情况。
 
 ###  提供 batch inference 的 API 接口
 
 实现于chat_api_openai.py
 
 使用办法：
-- python -m scripts.chat_api_batch --num-gpus 1 --port 8000 --max-batch-size 32
+- python -m scripts.chat_api_openai --num-gpus 1 --port 8000 --max-batch-size 32
 - curl -X POST http://localhost:8000/v1/batch/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -201,26 +216,39 @@ dev/run_attention_comparison.sh跑通，但对比不太明显，推断为数据�
 
 
 ### 测试配置
-- **Batch Size**: 8个不同长度的 prompts
+- **测试批次大小**: 1, 2, 4, 8
+- **测试数据**: 16个不同长度的 prompts
 - **Max Tokens**: 20
 - **Model**: d4 (4-layer, 256-dim)
 - **Prompts 长度范围**: 4-12 tokens
+- **Temperature**: 0.7, Top-k: 50
 
 ### 性能对比
 
-| 指标 | 批处理 | 串行 | 提升 |
-|------|--------|------|------|
-| **总耗时** | 0.792秒 | 1.285秒 | - |
-| **平均/序列** | 0.099秒 | 0.161秒 | - |
-| **加速比** | - | - | **1.62x** |
-| **效率提升** | - | - | **38.4%** |
+| Batch Size | 批处理耗时 | 串行耗时 | 批处理吞吐量 | 串行吞吐量 | 加速比 | 效率 |
+|------------|-----------|---------|-------------|-----------|--------|------|
+| 1 | 0.784秒 | 0.276秒 | 25.5 tok/s | 72.5 tok/s | 0.35x | -184.4% |
+| 2 | 0.135秒 | 0.375秒 | 297.3 tok/s | 106.7 tok/s | **2.79x** | 64.1% |
+| 4 | 0.206秒 | 0.724秒 | 291.4 tok/s | 82.8 tok/s | **3.52x** | 71.6% |
+| 8 | 0.301秒 | 1.526秒 | 464.5 tok/s | 91.8 tok/s | **5.06x** | 80.2% |
+
+**关键发现**:
+- **最佳加速比**: 5.06x（batch size = 8）
+- **最大吞吐量**: 464.5 tokens/s（batch size = 8）
+- 随着 batch size 增加，加速比和效率显著提升
+- Batch size = 1 时出现负优化（0.35x），原因是批处理python开销大于并行收益
 
 ### 正确性验证
 
-使用贪婪解码（temperature=0.0）验证：
+使用贪婪解码（temperature=0.0, seed=42）验证：
 - **序列 1**: 匹配
 - **序列 2**: 匹配
 - **序列 3**: 匹配
+- **序列 4**: 匹配
+- **序列 5**: 匹配
+- **序列 6**: 匹配
+
+所有输出匹配！批量处理结果与串行处理完全一致。
 
 性能测试脚本：test_batching.py 
 
@@ -242,6 +270,14 @@ dev/run_attention_comparison.sh跑通，但对比不太明显，推断为数据�
 - **核心方法**：nanochat/engine.py 中的 generate_speculative()
 - **分布修正**：speculative_sample() 函数 
 
+### 具体细节
+speculative_sample方法，返回是否接受以及sampled_token，如果接受sampled_token 就是 draft_tokens，如果拒绝sampled_token 是从修正分布 P' 采样出来的新token。
+- 初始化与预填充：初始化 target 和 draft 的 KV Cache，然后将原始 Prompt 输入两个模型，填充 KV Cache，最后获取首个 Token 的 Logits
+- Draft阶段：通过γ次循环采样γ个token，每次循环首先采样logits生成当前token，然后判断是否为终止符，若通过且仍需循环则生成下一个的current_draft_logits，每次循环保留logits到列表以便后续推测解码。
+- 验证阶段：将所有 draft_tokens 拼成一个 Batch 调用forward方法，收集 Logits。
+- 接受/拒绝：循环len(draft_tokens)次，调用speculative_sample方法判断每个token是拒绝还是接受并得到sampled_token，如果接受记录accepted+=1，否则触发拒绝逻辑：1.首先通过pos回滚大模型KV cache。2.对sampled_token调用forward方法，更新KV Cache并获取下一轮 Draft 所需的 Logits。3.回滚小模型KV cache。4.把修正后的token也调用forward给小模型
+- 奖励机制：如果draft_tokens，全被接受，则调用target model 采样下一个token，并更新draft 和 target model 的状态。
+
 ### 模型准备
 本实现使用两个模型：
 - **Draft Model**: `d4` (4层小模型) - 用于快速生成候选
@@ -250,6 +286,7 @@ dev/run_attention_comparison.sh跑通，但对比不太明显，推断为数据�
 ### 输出分布一致性保证
 - 数学：使用 Rejection Sampling with Correction，数学上保证输出分布与标准自回归完全一致。
 - 算法：对于每个 draft token，计算接受概率，接受 (概率 α)：使用 draft token，拒绝 (概率 1-α)：从修正分布采样。
+- 修正分布采样：通过speculative_sample() 中当target model拒绝了draft model的token后将概率分布修正为 max(0, p_target - p_draft)，再进行采样保证输出分布完全一致
 
 
 ### 测量加速比
@@ -319,6 +356,7 @@ dev/run_attention_comparison.sh跑通，但对比不太明显，推断为数据�
 
 
 
+
 # API服务
 
 ### 实现兼容 OpenAI 格式的 API endpoint
@@ -352,6 +390,14 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   }'
 
 
+### 具体细节
+
+- generate_stream_openai() 实现流式响应生成
+- generate_non_streaming()  生成完整响应后一次性返回
+- process_batch() 批量处理多个请求
+- API 批量完成端点模块  函数：batch_completions()，路由：POST /v1/batch/completions
+- API 聊天完成端点模块  函数：chat_completions()，路由：POST /v1/batch/completions，内置流式和非流式
+- 辅助功能：模型列表端点、健康检查端点等
 
 
 # 加分项（数据质量分析工具）
