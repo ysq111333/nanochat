@@ -310,7 +310,7 @@ dev/run_attention_comparison.sh跑通，但对比不太明显，推断为数据�
 
 ### top-p and top-k
 
-实现并切参数实时生效
+实现并且参数实时生效
 
 遇到的问题：初步代码会导致文字重叠，解决办法使用 Grid 布局：将 flex 改为 grid，用 grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)) 自动适配，避免重叠
 
