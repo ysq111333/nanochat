@@ -1,3 +1,35 @@
+## 📝 变更详解 (Detailed Changes)
+
+本次  包含 7 个独立的提交，涵盖了从核心优化到文档补充的完整工作流。具体分类说明如下：
+* **refactor: 性能优化、模型架构变体、推理加速**
+    * 提交于 Training-related code modifications
+    * 具体修改了 nanochat/engine.py、gpt.py、tokenize.py等核心代码以及一些相关脚本
+* **chore: 更新 .gitignore**
+    * 添加了 `wandb/`, `*.parquet`, 等忽略规则，确保仓库只保留代码，不包含临时数据。
+
+* **feat: 新增安全数据生成工作流**
+    * 提交于 data_code
+    * 引入了 `safety_data_workflow/` 模块，用于生成对抗性测试数据。
+    * 添加了 `dev/gen_safety_question.py` 等辅助生成脚本。
+
+* **data: 新增合成数据**
+    * 提交于 syntheic_safety_data
+    * 最终过滤后的合成数据为 data/safety_sft_conversations_multiturn_filtered.jsonl
+* **feat: 更新训练脚本与任务支持**
+    * 提交于 test
+    * 新增了 `AIME` 任务支持。
+    * 添加了 `test_batching.py` 用于验证批处理逻辑。
+
+* **docs: 添加项目说明文档**
+    * 提交于 readme_kimi
+    * 新增`README_kimi.md`，详细说明了设计思路和运行方法。
+    * 补充了实验结果截图。
+
+* **figure: 添加实验结果图**
+    * loss
+
+
+
 # 评估任务扩展
 
 
